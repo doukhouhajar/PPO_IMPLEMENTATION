@@ -84,8 +84,12 @@ def parse_args():
     # Algorithm arguments
     parser.add_argument('--num-envs', type=int, default=4, help='number of parallel game enviroments')
     parser.add_argument('--num-steps', type=int, default=128, help='number of steps to run in each env per policy rollout') # rollouts data = 4*128
-    parser.add_argument('anneal-lr', type=lambda x:bool(strtobool(x)), default=True,
-                        nargs='?', help='learning rate aneealing for policy and value networks') 
+    parser.add_argument('--anneal-lr', type=lambda x:bool(strtobool(x)), default=True,
+                        nargs='?', help='learning rate annealing for policy and value networks')
+    parser.add_argument('--gae', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
+                        const=True, help='use General Advantage Estimation for advantange computation') 
+    parser.add_argument('--gamma', type=float, default=0.99, help='discount factor')
+    parser.add_argument('--gae-lambda', type=float, default=0.95, help='lambda for gae')
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     return args
@@ -157,7 +161,7 @@ if __name__=="__main__":
     #print("agent.get_action_and_value(next_obs)", agent.get_action_and_value(next_obs))
 
     for update in range (1, num_updates + 1):
-        if args.anneal_rl:
+        if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
@@ -169,22 +173,26 @@ if __name__=="__main__":
 
             # action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_done)
-                values[step] = value.flattern()
+                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
             # execute the game and log data
-            next_obs, reward, done, info = envs.step(action.cpu().numpy())
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
+            next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+            done = np.logical_or(terminated, truncated)
+            rewards[step] = torch.as_tensor(reward, dtype=torch.float32, device=device).view(-1)  # Cannot convert a MPS Tensor to float64 dtype as the MPS framework doesn't support float64. Please use float32 instead
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
-            for item in info:
-                if "episode" in item.keys():
-                    print(f"global_step={global_step}, episodic_return={item['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", item["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", item["episode"]["l"], global_step)
-                    break
+            if "_episode" in info: # for vector envs, info is a dict of arrays, not a list of dicts
+                for i, finished in enumerate(info["_episode"]):
+                    if finished:
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r'][i]}")
+                        writer.add_scalar("charts/episodic_return", info["episode"]["r"][i], global_step)
+                        writer.add_scalar("charts/episodic_length", info["episode"]["l"][i], global_step)
+
+            
+        # bootstrap reward if not done 
 
 
 
