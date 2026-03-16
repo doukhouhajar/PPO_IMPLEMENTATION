@@ -16,11 +16,11 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         env = gym.make(gym_id,render_mode="rgb_array") # if want to record add: render_mode="rgb_array"
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
-            if idx == 0:
+            if idx == 0: # record video for the first environment
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda t: t % 100 == 0)
-            #env.seed(seed)
-            env.action_space.seed(seed)
-            env.observation_space.seed(seed)
+        #env.seed(seed)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
         return env
     return thunk
 
@@ -52,10 +52,10 @@ class Agent(nn.Module):
     
     def get_action_and_value(self, x, action=None):
         logits = self.actor(x)
-        probs = Categorical(logits=logits)
+        probs = Categorical(logits=logits) # categorical distribution using softmax internally
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(x) # log_prob gonna be used in the loss
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -132,7 +132,7 @@ if __name__=="__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.use_deterministic_algorithms(args.torch_deterministic)
+    torch.use_deterministic_algorithms(args.torch_deterministic) # because GPU uses parallel algorithms so it might produce slightly diff results
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda
                           else "mps" if torch.backends.mps.is_available() and args.mps
@@ -174,7 +174,7 @@ if __name__=="__main__":
 
     for update in range (1, num_updates + 1):
         if args.anneal_lr:
-            frac = 1.0 - (update - 1.0) / num_updates
+            frac = 1.0 - (update - 1.0) / num_updates # goes from 1 to 0
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
