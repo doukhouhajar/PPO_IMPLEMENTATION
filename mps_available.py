@@ -7,3 +7,5 @@ if torch.backends.mps.is_available():
     print("MPS device found, using GPU")
 else:
     print("MPS device not found. Training will run on CPU")
+
+

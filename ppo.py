@@ -61,14 +61,10 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
                         help='name of the experiement')
-    parser.add_argument('--gym-id', type=str, default="CartPole-v1",
-                        help='gym env id')
-    parser.add_argument('--learning-rate', type=float, default=2.5e-4,
-                        help='learning rate of the optimizer')
-    parser.add_argument('--seed', type=int, default=1,
-                        help='seed of the experiment')
-    parser.add_argument('--total-timesteps', type=int, default=25000,
-                        help='total timesteps of the experiment')
+    parser.add_argument('--gym-id', type=str, default="CartPole-v1", help='gym env id')
+    parser.add_argument('--learning-rate', type=float, default=2.5e-4, help='learning rate of the optimizer')
+    parser.add_argument('--seed', type=int, default=1, help='seed of the experiment')
+    parser.add_argument('--total-timesteps', type=int, default=25000, help='total timesteps of the experiment')
     parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True,
                         nargs='?', const=True, help='use determinitic PyTorch when possible') # implement with torch.use_deterministic_algorithms
     parser.add_argument('--mps', type=lambda x:bool(strtobool(x)), default=True,
@@ -119,7 +115,7 @@ if __name__=="__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
-            monitor_gym=True,
+            monitor_gym=False, # for W&B and Gymnasium record video systems
             save_code=True,
         )
     writer = SummaryWriter(f"runs/{run_name}")
@@ -249,7 +245,7 @@ if __name__=="__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, new_values = agent.get_action_and_value(
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], b_actions.long()[mb_inds]
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
@@ -257,10 +253,10 @@ if __name__=="__main__":
 
                 # debug variable
                 with torch.no_grad():
-                    old_approc_kl = (-logratio).mean()
+                    old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean()] # how often the clipped objective is actually triggered
-
+                    clipfracs += [(((ratio - 1.0).abs() > args.clip_coef).float().mean()).item()] # how often the clipped objective is actually triggered
+                    # .item() because this is just a logging scalar and afterwards we will use np.mean, so we convert each tensor to a py scalar
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
@@ -311,7 +307,7 @@ if __name__=="__main__":
         writer.add_scalar("loss/clipfrac", np.mean(clipfracs), global_step) 
         writer.add_scalar("loss/explained_variance", explained_var, global_step)  
         print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step) # Steps Per Second
 
     envs.close()
     writer.close()
