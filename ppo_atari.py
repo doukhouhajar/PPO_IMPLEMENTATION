@@ -5,9 +5,18 @@ import time
 import random
 import numpy as np
 import gymnasium as gym
+import ale_py
+gym.register_envs(ale_py)
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from stable_baselines3.common.atari_wrappers import (
+    NoopResetEnv,
+    MaxAndSkipEnv,
+    EpisodicLifeEnv,
+    FireResetEnv,
+    ClipRewardEnv,
+)
 from torch.distributions import Categorical 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -19,6 +28,15 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         else : 
             env = gym.make(gym_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = NoopResetEnv(env, noop_max=30)
+        env = MaxAndSkipEnv(env, skip=4)
+        env = EpisodicLifeEnv(env)
+        if "FIRE" in env.unwrapped.get_action_meanings():
+            env = FireResetEnv(env) # test it because apparently I've never been on live television before
+        env = ClipRewardEnv(env)
+        env = gym.wrappers.ResizeObservation(env, (84, 84))
+        env = gym.wrappers.GrayscaleObservation(env)
+        env = gym.wrappers.FrameStackObservation(env, 4) # stack the 4 past obs as a single obs
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -32,39 +50,39 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super(Agent, self).__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.),
+        self.network = nn.Sequential(
+            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+            layer_init(nn.Linear(64*7*7, 512)),
+            nn.ReLU(),
         )
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
-        )
+        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(512, 1), std=1)
     
     def get_value(self, x):
-        return self.critic(x)
+        return self.critic(self.network(x / 255.0))
     
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        hidden = self.network(x / 255.0)
+        logits = self.actor(hidden)
         probs = Categorical(logits=logits) # categorical distribution using softmax internally
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x) # log_prob gonna be used in the loss
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden) # log_prob gonna be used in the loss
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
                         help='name of the experiement')
-    parser.add_argument('--gym-id', type=str, default="CartPole-v1", help='gym env id')
+    parser.add_argument('--gym-id', type=str, default="ALE/Breakout-v5", help='gym env id')
     parser.add_argument('--learning-rate', type=float, default=2.5e-4, help='learning rate of the optimizer')
     parser.add_argument('--seed', type=int, default=1, help='seed of the experiment')
-    parser.add_argument('--total-timesteps', type=int, default=5000000, help='total timesteps of the experiment')
+    parser.add_argument('--total-timesteps', type=int, default=10000000, help='total timesteps of the experiment')
     parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True,
                         nargs='?', const=True, help='use determinitic PyTorch when possible') # implement with torch.use_deterministic_algorithms
     parser.add_argument('--mps', type=lambda x:bool(strtobool(x)), default=True,
@@ -78,7 +96,7 @@ def parse_args():
     parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=False,
                         nargs='?', const=True, help='capture video of the agent performance')
     # Algorithm arguments
-    parser.add_argument('--num-envs', type=int, default=4, help='number of parallel game enviroments')
+    parser.add_argument('--num-envs', type=int, default=8, help='number of parallel game enviroments')
     parser.add_argument('--num-steps', type=int, default=128, help='number of steps to run in each env per policy rollout') # rollouts data = 4*128
     parser.add_argument('--anneal-lr', type=lambda x:bool(strtobool(x)), default=True,
                         nargs='?', const=True, help='learning rate annealing for policy and value networks')
@@ -90,7 +108,7 @@ def parse_args():
     parser.add_argument('--update-epochs', type=int, default=4, help='the k epochs to update the policy')
     parser.add_argument('--norm-adv', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
                         const=True, help='toggles advantages normalization')
-    parser.add_argument('--clip-coef', type=float, default=0.2, help='the surrogate clipping coefficient')
+    parser.add_argument('--clip-coef', type=float, default=0.1, help='the surrogate clipping coefficient')
     parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
                         const=True, help='whether or not use a clipped loss for the value funtion, as per the paper')
     parser.add_argument('--ent-coef', type=float, default=0.01, help='coefficient of the entropy')
@@ -140,8 +158,7 @@ if __name__=="__main__":
          for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-    #print("envs.single_observation_space.shape", envs.single_observation_space.shape)
-    #print("envs.single_action_space.n", envs.single_action_space.n)
+    
 
     agent = Agent(envs).to(device)
     #print(agent)
@@ -162,11 +179,7 @@ if __name__=="__main__":
     next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
     next_done = torch.zeros(args.num_envs, dtype=torch.float32, device=device) # Tensor vs as_tensor
     num_updates = args.total_timesteps // args.batch_size
-    #print(num_updates)
-    #print("next_obs.shape", next_obs.shape)
-    #print("agent.get_value(next_obs)", agent.get_value(next_obs))
-    #rint("agent.get_value(next_obs).shape", agent.get_value(next_obs).shape)
-    #print("agent.get_action_and_value(next_obs)", agent.get_action_and_value(next_obs))
+
 
     for update in range (1, num_updates + 1):
         if args.anneal_lr:
@@ -315,46 +328,3 @@ if __name__=="__main__":
 
 
 
-
-
-    '''
-    env = gym.make('CartPole-v1', render_mode='rgb_array')
-    env = gym.wrappers.RecordEpisodeStatistics(env)
-    env = gym.wrappers.RecordVideo(env, "videos", episode_trigger=lambda t: t % 100 == 0) #, record_video_trigger=lambda t: t % 100 == 0
-    observation, info = env.reset()
-    #episodic_return = 0
-    for _ in range(200):
-        action = env.action_space.sample()
-        observation, reward, terminated, truncated, info1 = env.step(action)
-        #episodic_return += reward
-        if terminated or truncated :
-            observation, info = env.reset()
-            print(f"episodic return: {info1['episode']['r']}")
-            #print(f"episodic return: {episodic_return}")
-            #episodic_return = 0
-    env.close()
-    '''
-    '''
-    def make_env(gym_id):
-        def thunk():
-            env = gym.make(gym_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordEpisodeStatistics(env)
-            env = gym.wrappers.RecordVideo(env, "videos", episode_trigger=lambda t: t % 100 == 0)
-            return env
-        return thunk
-    
-    envs =  gym.vector.SyncVectorEnv([make_env(args.gym_id)])
-    observation, info = envs.reset()
-    for _ in range(200):
-        action = envs.action_space.sample()
-        observation, reward, terminated, truncated, info = envs.step(action)
-        done = terminated or truncated
-        if "_episode" in info:
-            for i, done in enumerate(info["_episode"]):
-                if done:
-                    print(f"episodic return {info['episode']['r'][i]}") 
-    '''
-
-
-
-  
