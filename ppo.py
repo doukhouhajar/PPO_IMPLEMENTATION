@@ -138,7 +138,7 @@ if __name__=="__main__":
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name)
          for i in range(args.num_envs)]
-    )
+    ) # what about AsyncVectorEnv for MuJoCo, it's faster for heavy envs
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
     #print("envs.single_observation_space.shape", envs.single_observation_space.shape)
     #print("envs.single_action_space.n", envs.single_action_space.n)
@@ -148,7 +148,7 @@ if __name__=="__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device) # the + is a tuple concatenation !
     actions = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long, device=device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -174,7 +174,7 @@ if __name__=="__main__":
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
-        for step in range(0, args.num_steps):
+        for step in range(0, args.num_steps): # collect rollout data
             global_step += 1 * args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
@@ -198,23 +198,23 @@ if __name__=="__main__":
                     if finished:
                         print(f"global_step={global_step}, episodic_return={info['episode']['r'][i]}")
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"][i], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"][i], global_step)
+                        writer.add_scalar("charts/episodic_length", info["episode"]["l"][i], global_step) 
 
             
         # bootstrap reward if not done 
         with torch.no_grad():
-            next_value =  agent.get_value(next_obs).reshape(1, -1)
+            next_value =  agent.get_value(next_obs).reshape(1, -1) # because the rollout might stop mid episode
             if args.gae:
                 advantages = torch.zeros_like(rewards).to(device)
-                lastgaelam = 0
+                lastgaelam = 0 # to accumulates GAE
                 for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
+                    if t == args.num_steps - 1: # for the last timestep
+                        nextnonterminal = 1.0 - next_done # if ep ended we have no future value
                         nextvalues = next_value
                     else:
                         nextnonterminal = 1.0 - dones[t+1]
                         nextvalues = values[t + 1]
-                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t] # TD residual, how wrong was the value estimate
                     advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                 returns = advantages + values
             else:
@@ -263,7 +263,7 @@ if __name__=="__main__":
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # policy loss 
+                # policy loss / PPO clipping
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean() # we max negatives, tandis que in the paper they min positives
