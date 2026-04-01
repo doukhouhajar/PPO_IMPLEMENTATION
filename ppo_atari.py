@@ -30,7 +30,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = NoopResetEnv(env, noop_max=30)
         env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
+        env = EpisodicLifeEnv(env) # wrapper could be detrimental to the agent’s performance !
         if "FIRE" in env.unwrapped.get_action_meanings():
             env = FireResetEnv(env) # test it because apparently I've never been on live television before
         env = ClipRewardEnv(env)
