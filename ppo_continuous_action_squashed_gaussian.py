@@ -5,19 +5,12 @@ import time
 import random
 import numpy as np
 import gymnasium as gym
-import ale_py
-gym.register_envs(ale_py)
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from stable_baselines3.common.atari_wrappers import (
-    NoopResetEnv,
-    MaxAndSkipEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    ClipRewardEnv,
-)
-from torch.distributions import Categorical 
+from torch.distributions import Normal, TransformedDistribution
+from torch.distributions.transforms import TanhTransform, AffineTransform
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 def make_env(gym_id, seed, idx, capture_video, run_name):
@@ -28,15 +21,11 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         else : 
             env = gym.make(gym_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env) # wrapper could be detrimental to the agent’s performance !
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env) # test it because apparently I've never been on live television before
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayscaleObservation(env)
-        env = gym.wrappers.FrameStackObservation(env, 4) # stack the 4 past obs as a single obs
+        #env = gym.wrappers.ClipAction(env) # for the squashed Gaussian 
+        env = gym.wrappers.NormalizeObservation(env)
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10),  env.observation_space) # the transformation we do (clipping) does not change the obs space so we use the same obs space, otherways we must provide the new obs space after transformation
+        env = gym.wrappers.NormalizeReward(env)
+        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10)) # be careful this can make the task harder for the critic
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -50,39 +39,89 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super(Agent, self).__init__()
-        self.network = nn.Sequential(
-            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-            nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(64*7*7, 512)),
-            nn.ReLU(),
+        #####
+        obs_dim = int(np.array(envs.single_observation_space.shape).prod())
+        act_dim = int(np.prod(envs.single_action_space.shape))
+        #####
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 1), std=1.),
         )
-        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(512, 1), std=1)
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+
+        # box action spaces
+        action_high = torch.as_tensor(envs.single_action_space.high, dtype=torch.float32)
+        action_low = torch.as_tensor(envs.single_action_space.low, dtype=torch.float32)
+        self.register_buffer("action_scale", (action_high - action_low) / 2.0)
+        self.register_buffer("action_bias", (action_high + action_low) / 2.0)
     
     def get_value(self, x):
-        return self.critic(self.network(x / 255.0))
-    
+        return self.critic(x)
+
+    def get_dist(self, x):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean) - 2.0 # negative offset
+        action_std = F.softplus(action_logstd) + 1e-5
+
+        base_dist = Normal(action_mean, action_std)
+
+        dist = TransformedDistribution(
+            base_dist,
+            [
+                TanhTransform(cache_size=1),
+                AffineTransform(loc=self.action_bias, scale=self.action_scale),
+            ],
+        )
+        return dist
+
     def get_action_and_value(self, x, action=None):
-        hidden = self.network(x / 255.0)
-        logits = self.actor(hidden)
-        probs = Categorical(logits=logits) # categorical distribution using softmax internally
+        dist = self.get_dist(x)
+
+        if action is None:
+            action = dist.rsample()   # or dist.sample()
+
+        # keep slightly inside bounds for inverse-transform stability in log_prob
+        eps = 1e-6
+        low = self.action_bias - self.action_scale + eps
+        high = self.action_bias + self.action_scale - eps
+        action_for_logprob = torch.clamp(action, low, high)
+
+        log_prob = dist.log_prob(action_for_logprob).sum(-1)
+
+        # Monte-Carlo entropy estimate for squashed policy
+        entropy_action = dist.rsample()
+        entropy = -dist.log_prob(entropy_action).sum(-1)
+
+        return action, log_prob, entropy, self.critic(x)
+    
+    '''
+    def get_action_and_value(self, x, action=None):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std) 
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden) # log_prob gonna be used in the loss
-
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x) # log_prob gonna be used in the loss
+    '''
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
                         help='name of the experiement')
-    parser.add_argument('--gym-id', type=str, default="ALE/Breakout-v5", help='gym env id')
-    parser.add_argument('--learning-rate', type=float, default=3e-4, help='learning rate of the optimizer') # 2.5e-4
+    parser.add_argument('--gym-id', type=str, default="HalfCheetah-v5", help='gym env id')
+    parser.add_argument('--learning-rate', type=float, default=3e-4, help='learning rate of the optimizer')
     parser.add_argument('--seed', type=int, default=1, help='seed of the experiment')
-    parser.add_argument('--total-timesteps', type=int, default=10000000, help='total timesteps of the experiment')
+    parser.add_argument('--total-timesteps', type=int, default=2000000, help='total timesteps of the experiment')
     parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True,
                         nargs='?', const=True, help='use determinitic PyTorch when possible') # implement with torch.use_deterministic_algorithms
     parser.add_argument('--mps', type=lambda x:bool(strtobool(x)), default=True,
@@ -91,27 +130,27 @@ def parse_args():
                         nargs='?', const=True, help='enable CUDA when available')
     parser.add_argument('--track', type=lambda x:bool(strtobool(x)), default=False,
                          nargs='?', const=True, help='if toggled, this expirement will be tracked with Weights and Biases')
-    parser.add_argument('--wandb-project-name', type=str, default='cleanRL', help='wandb project name')
+    parser.add_argument('--wandb-project-name', type=str, default='PPO', help='wandb project name')
     parser.add_argument('--wandb-entity', type=str, default=None, help='team of wandb project')
     parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=False,
                         nargs='?', const=True, help='capture video of the agent performance')
     # Algorithm arguments
-    parser.add_argument('--num-envs', type=int, default=8, help='number of parallel game enviroments')
-    parser.add_argument('--num-steps', type=int, default=128, help='number of steps to run in each env per policy rollout') # rollouts data = 4*128
+    parser.add_argument('--num-envs', type=int, default=4, help='number of parallel game enviroments')
+    parser.add_argument('--num-steps', type=int, default=2048, help='number of steps to run in each env per policy rollout') # rollouts data = 4*128
     parser.add_argument('--anneal-lr', type=lambda x:bool(strtobool(x)), default=True,
                         nargs='?', const=True, help='learning rate annealing for policy and value networks')
     parser.add_argument('--gae', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
                         const=True, help='use General Advantage Estimation for advantange computation') 
     parser.add_argument('--gamma', type=float, default=0.99, help='discount factor')
     parser.add_argument('--gae-lambda', type=float, default=0.95, help='lambda for gae')
-    parser.add_argument('--num-minibatches', type=int, default=4, help ='number of minibatches')
-    parser.add_argument('--update-epochs', type=int, default=4, help='the k epochs to update the policy')
+    parser.add_argument('--num-minibatches', type=int, default=32, help ='number of minibatches')
+    parser.add_argument('--update-epochs', type=int, default=10, help='the k epochs to update the policy')
     parser.add_argument('--norm-adv', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
                         const=True, help='toggles advantages normalization')
-    parser.add_argument('--clip-coef', type=float, default=0.1, help='the surrogate clipping coefficient')
-    parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
+    parser.add_argument('--clip-coef', type=float, default=0.25, help='the surrogate clipping coefficient')
+    parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=False, nargs='?',  # remove Value loss clipping
                         const=True, help='whether or not use a clipped loss for the value funtion, as per the paper')
-    parser.add_argument('--ent-coef', type=float, default=0.01, help='coefficient of the entropy')
+    parser.add_argument('--ent-coef', type=float, default=0.0, help='coefficient of the entropy') # unlike Atari
     parser.add_argument('--vf-coef', type=float, default=0.5, help='coefficient of the value function')
     parser.add_argument('--max-grad-norm', type=float, default=0.5, help='the max norm for the gradient clipping')
     parser.add_argument('--target-kl', type=float, default=None, help='the target KL divergence threshold') # for early stopping, also in OpenAI Spinning default=0.015
@@ -123,7 +162,7 @@ def parse_args():
 if __name__=="__main__":
     args = parse_args()
     #print(args) 
-    run_name = f"{args.gym_id}_{args.exp_name}_{args.seed}_{int(time.time())}"   
+    run_name = f"{args.gym_id}_{args.seed}_{int(time.time())}"   
     if args.track:
         import wandb
 
@@ -133,6 +172,7 @@ if __name__=="__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
+            group=f"ppo-{args.gym_id}",
             monitor_gym=False, # for W&B and Gymnasium record video systems
             save_code=True,
         )
@@ -157,20 +197,20 @@ if __name__=="__main__":
         [make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name)
          for i in range(args.num_envs)]
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-    
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+   
     agent = Agent(envs).to(device)
     #print(agent)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long, device=device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, device=device) # HalfCheetah-v5 has a 6-dimensional continuous action space
+    logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
+    rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
+    dones = torch.zeros((args.num_steps, args.num_envs), device=device)
+    values = torch.zeros((args.num_steps, args.num_envs), device=device)
 
     # Start the game
     global_step = 0
@@ -179,8 +219,7 @@ if __name__=="__main__":
     next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
     next_done = torch.zeros(args.num_envs, dtype=torch.float32, device=device) # Tensor vs as_tensor
     num_updates = args.total_timesteps // args.batch_size
-
-
+   
     for update in range (1, num_updates + 1):
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates # goes from 1 to 0
@@ -194,7 +233,7 @@ if __name__=="__main__":
 
             # action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value = agent.get_action_and_value(next_obs) # action coming out of get_action_and_value has shape (num_envs, 6) = (1, 6)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -216,7 +255,7 @@ if __name__=="__main__":
             
         # bootstrap reward if not done 
         with torch.no_grad():
-            next_value =  agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(next_obs).flatten() #agent.get_value(next_obs).reshape(1, -1)
             if args.gae:
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
@@ -260,7 +299,7 @@ if __name__=="__main__":
                 mb_inds = b_inds[start:end]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions.long()[mb_inds]
+                    b_obs[mb_inds], b_actions[mb_inds]
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -299,7 +338,7 @@ if __name__=="__main__":
                 entropy_loss = entropy.mean() # entropy = chaos, max entropy = more exploration
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef # min policy loss and values loss, and max entropy loss
 
-                optimizer.zero_grad()
+                optimizer.zero_grad() # .zero_grad y .step
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -328,3 +367,4 @@ if __name__=="__main__":
 
 
 
+  

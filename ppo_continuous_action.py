@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.normal import Normal 
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 def make_env(gym_id, seed, idx, capture_video, run_name):
@@ -58,8 +59,10 @@ class Agent(nn.Module):
     
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
+        raw_std = self.actor_std_head(x) - 2.0   # negative offset
+        action_std = F.Softplus(raw_std) + 1e-5 # softplus to transform network output into action standard deviation 
+        #action_logstd = self.actor_logstd.expand_as(action_mean)
+        #action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std) 
         if action is None:
             action = probs.sample()
@@ -81,7 +84,7 @@ def parse_args():
                         nargs='?', const=True, help='enable CUDA when available')
     parser.add_argument('--track', type=lambda x:bool(strtobool(x)), default=False,
                          nargs='?', const=True, help='if toggled, this expirement will be tracked with Weights and Biases')
-    parser.add_argument('--wandb-project-name', type=str, default='cleanRL', help='wandb project name')
+    parser.add_argument('--wandb-project-name', type=str, default='PPO', help='wandb project name')
     parser.add_argument('--wandb-entity', type=str, default=None, help='team of wandb project')
     parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=False,
                         nargs='?', const=True, help='capture video of the agent performance')
@@ -99,9 +102,9 @@ def parse_args():
     parser.add_argument('--norm-adv', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
                         const=True, help='toggles advantages normalization')
     parser.add_argument('--clip-coef', type=float, default=0.2, help='the surrogate clipping coefficient')
-    parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
+    parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=False, nargs='?',
                         const=True, help='whether or not use a clipped loss for the value funtion, as per the paper')
-    parser.add_argument('--ent-coef', type=float, default=0.0, help='coefficient of the entropy')
+    parser.add_argument('--ent-coef', type=float, default=0.01, help='coefficient of the entropy') # unlike Atari
     parser.add_argument('--vf-coef', type=float, default=0.5, help='coefficient of the value function')
     parser.add_argument('--max-grad-norm', type=float, default=0.5, help='the max norm for the gradient clipping')
     parser.add_argument('--target-kl', type=float, default=None, help='the target KL divergence threshold') # for early stopping, also in OpenAI Spinning default=0.015
@@ -113,7 +116,7 @@ def parse_args():
 if __name__=="__main__":
     args = parse_args()
     #print(args) 
-    run_name = f"{args.gym_id}_{args.exp_name}_{args.seed}_{int(time.time())}"   
+    run_name = f"{args.gym_id}_{args.seed}_{int(time.time())}"   
     if args.track:
         import wandb
 
@@ -123,6 +126,7 @@ if __name__=="__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
+            group=f"ppo-{args.gym_id}",
             monitor_gym=False, # for W&B and Gymnasium record video systems
             save_code=True,
         )
@@ -290,7 +294,7 @@ if __name__=="__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm) # global l2 does not exceed 0.5
                 optimizer.step()
 
             if args.target_kl is not None:
