@@ -8,7 +8,7 @@ import gymnasium as gym
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions.normal import Normal 
+from torch.distributions import Normal
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
@@ -20,7 +20,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         else : 
             env = gym.make(gym_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = gym.wrappers.ClipAction(env)
+        env = gym.wrappers.ClipAction(env) 
         env = gym.wrappers.NormalizeObservation(env)
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10),  env.observation_space) # the transformation we do (clipping) does not change the obs space so we use the same obs space, otherways we must provide the new obs space after transformation
         env = gym.wrappers.NormalizeReward(env)
@@ -45,6 +45,7 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.),
         )
+        # two actor separate MLP, we can make a shared backbone and two separate heads
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
@@ -53,21 +54,49 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
         )
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+
+        '''self.actor_std_head = nn.Sequential(
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
+        )'''
     
     def get_value(self, x):
         return self.critic(x)
-    
+    '''
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
-        raw_std = self.actor_std_head(x) - 2.0   # negative offset
-        action_std = F.Softplus(raw_std) + 1e-5 # softplus to transform network output into action standard deviation 
-        #action_logstd = self.actor_logstd.expand_as(action_mean)
-        #action_std = torch.exp(action_logstd)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std) 
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x) # log_prob gonna be used in the loss
+    '''
+    '''
+    def get_action_and_value(self, x, action=None):
+        action_mean = self.actor_mean(x)
+        raw_std = self.actor_std_head(x) - 2.0   # negative offset, tune it afterwards
+        action_std = F.softplus(raw_std) + 1e-5 # softplus to transform network output into action standard deviation, the + 1e-5 is there to prevent std=0 
+        probs = Normal(action_mean, action_std) 
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x) # log_prob gonna be used in the loss
+    '''
+
+    # state indep with softplus
+    def get_action_and_value(self, x, action=None):
+        action_mean = self.actor_mean(x)
+        raw_std = self.actor_logstd.expand_as(action_mean) - 2.0   # negative offset, tune it afterwards
+        action_std = F.softplus(raw_std) + 1e-5 # softplus to transform network output into action standard deviation, the + 1e-5 is there to prevent std=0 
         probs = Normal(action_mean, action_std) 
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x) # log_prob gonna be used in the loss
 
+   
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
@@ -101,10 +130,10 @@ def parse_args():
     parser.add_argument('--update-epochs', type=int, default=10, help='the k epochs to update the policy')
     parser.add_argument('--norm-adv', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
                         const=True, help='toggles advantages normalization')
-    parser.add_argument('--clip-coef', type=float, default=0.2, help='the surrogate clipping coefficient')
-    parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=False, nargs='?',
+    parser.add_argument('--clip-coef', type=float, default=0.25, help='the surrogate clipping coefficient')
+    parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=False, nargs='?',  # remove Value loss clipping
                         const=True, help='whether or not use a clipped loss for the value funtion, as per the paper')
-    parser.add_argument('--ent-coef', type=float, default=0.01, help='coefficient of the entropy') # unlike Atari
+    parser.add_argument('--ent-coef', type=float, default=0.00, help='coefficient of the entropy') 
     parser.add_argument('--vf-coef', type=float, default=0.5, help='coefficient of the value function')
     parser.add_argument('--max-grad-norm', type=float, default=0.5, help='the max norm for the gradient clipping')
     parser.add_argument('--target-kl', type=float, default=None, help='the target KL divergence threshold') # for early stopping, also in OpenAI Spinning default=0.015
@@ -209,7 +238,7 @@ if __name__=="__main__":
             
         # bootstrap reward if not done 
         with torch.no_grad():
-            next_value =  agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(next_obs).flatten()
             if args.gae:
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
@@ -292,16 +321,19 @@ if __name__=="__main__":
                 entropy_loss = entropy.mean() # entropy = chaos, max entropy = more exploration
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef # min policy loss and values loss, and max entropy loss
 
-                optimizer.zero_grad()
+                optimizer.zero_grad() # .zero_grad y .step
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm) # global l2 does not exceed 0.5
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        #y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        with torch.no_grad():
+            y_pred = agent.get_value(b_obs).view(-1).cpu().numpy()
+        y_true = b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y    # if value function is a good indicator of the returns   
 

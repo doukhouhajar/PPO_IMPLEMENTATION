@@ -39,10 +39,9 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super(Agent, self).__init__()
-        #####
         obs_dim = int(np.array(envs.single_observation_space.shape).prod())
         act_dim = int(np.prod(envs.single_action_space.shape))
-        #####
+    
         self.critic = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
@@ -70,50 +69,36 @@ class Agent(nn.Module):
 
     def get_dist(self, x):
         action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean) - 2.0 # negative offset
-        action_std = F.softplus(action_logstd) + 1e-5
+        raw_std = self.actor_logstd.expand_as(action_mean) - 2.0 # negative offset
+        action_std = F.softplus(raw_std) + 1e-5
 
         base_dist = Normal(action_mean, action_std)
-
         dist = TransformedDistribution(
             base_dist,
-            [
-                TanhTransform(cache_size=1),
-                AffineTransform(loc=self.action_bias, scale=self.action_scale),
-            ],
+            [TanhTransform(cache_size=1),
+            AffineTransform(loc=self.action_bias, scale=self.action_scale),],
         )
         return dist
 
     def get_action_and_value(self, x, action=None):
         dist = self.get_dist(x)
-
         if action is None:
-            action = dist.rsample()   # or dist.sample()
+            action = dist.rsample()   # or dist.sample() # uses reparameterization trick, back to loi normale centrée réduite
 
         # keep slightly inside bounds for inverse-transform stability in log_prob
         eps = 1e-6
         low = self.action_bias - self.action_scale + eps
         high = self.action_bias + self.action_scale - eps
-        action_for_logprob = torch.clamp(action, low, high)
+        action_for_logprob = torch.clamp(action, low, high) # avoid explosion because atanh(1)= inf
 
         log_prob = dist.log_prob(action_for_logprob).sum(-1)
 
-        # Monte-Carlo entropy estimate for squashed policy
+        # Monte Carlo entropy estimate, because its harder now to compute entropy with log and tanh
         entropy_action = dist.rsample()
         entropy = -dist.log_prob(entropy_action).sum(-1)
 
         return action, log_prob, entropy, self.critic(x)
     
-    '''
-    def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std) 
-        if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x) # log_prob gonna be used in the loss
-    '''
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
@@ -153,7 +138,7 @@ def parse_args():
     parser.add_argument('--ent-coef', type=float, default=0.0, help='coefficient of the entropy') # unlike Atari
     parser.add_argument('--vf-coef', type=float, default=0.5, help='coefficient of the value function')
     parser.add_argument('--max-grad-norm', type=float, default=0.5, help='the max norm for the gradient clipping')
-    parser.add_argument('--target-kl', type=float, default=None, help='the target KL divergence threshold') # for early stopping, also in OpenAI Spinning default=0.015
+    parser.add_argument('--target-kl', type=float, default=0.015, help='the target KL divergence threshold') # for early stopping, also in OpenAI Spinning default=0.015
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
