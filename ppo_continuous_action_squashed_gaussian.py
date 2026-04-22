@@ -24,8 +24,8 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         #env = gym.wrappers.ClipAction(env) # for the squashed Gaussian 
         env = gym.wrappers.NormalizeObservation(env)
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10),  env.observation_space) # the transformation we do (clipping) does not change the obs space so we use the same obs space, otherways we must provide the new obs space after transformation
-        env = gym.wrappers.NormalizeReward(env)
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10)) # be careful this can make the task harder for the critic
+        #env = gym.wrappers.NormalizeReward(env)
+        #env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10)) # be careful this can make the task harder for the critic
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
@@ -225,10 +225,10 @@ if __name__=="__main__":
 
             # execute the game and log data
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
-            done = np.logical_or(terminated, truncated)
+            #done = np.logical_or(terminated, truncated)
             rewards[step] = torch.as_tensor(reward, dtype=torch.float32, device=device).view(-1)  # Cannot convert a MPS Tensor to float64 dtype as the MPS framework doesn't support float64. Please use float32 instead
             next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
-            next_done = torch.as_tensor(done, dtype=torch.float32, device=device)
+            next_done = torch.as_tensor(terminated, dtype=torch.float32, device=device)
 
             if "_episode" in info: # for vector envs, info is a dict of arrays, not a list of dicts
                 for i, finished in enumerate(info["_episode"]):
@@ -332,7 +332,10 @@ if __name__=="__main__":
                 if approx_kl > args.target_kl:
                     break
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        #y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        with torch.no_grad():
+            y_pred = agent.get_value(b_obs).view(-1).cpu().numpy()
+        y_true = b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y    # if value function is a good indicator of the returns   
 
@@ -344,6 +347,11 @@ if __name__=="__main__":
         writer.add_scalar("loss/approx_kl", approx_kl.item(), global_step) 
         writer.add_scalar("loss/clipfrac", np.mean(clipfracs), global_step) 
         writer.add_scalar("loss/explained_variance", explained_var, global_step)  
+        # debug critic 
+        writer.add_scalar("debug/returns_std", b_returns.std().item(), global_step)
+        writer.add_scalar("debug/values_std", torch.as_tensor(y_pred).std().item(), global_step)
+        writer.add_scalar("debug/returns_mean", b_returns.mean().item(), global_step)
+        writer.add_scalar("debug/var_y", float(var_y), global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step) # Steps Per Second
 

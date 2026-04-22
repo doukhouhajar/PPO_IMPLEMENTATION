@@ -12,72 +12,6 @@ from torch.distributions.beta import Beta
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-'''
-# Include the Jacobian correction in the returned log-prob, and optionally correct entropy too.
-class Agent(nn.Module):
-    def __init__(self, envs):
-        super().__init__()
-        obs_dim = int(np.prod(envs.single_observation_space.shape))
-        act_dim = int(np.prod(envs.single_action_space.shape))
-
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
-
-        self.actor_backbone = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-        )
-
-        self.actor_alpha = layer_init(nn.Linear(64, act_dim), std=0.01)
-        self.actor_beta = layer_init(nn.Linear(64, act_dim), std=0.01)
-
-        self.register_buffer("act_low", torch.tensor(envs.single_action_space.low, dtype=torch.float32))
-        self.register_buffer("act_high", torch.tensor(envs.single_action_space.high, dtype=torch.float32))
-        self.register_buffer("act_scale", self.act_high - self.act_low)
-        self.register_buffer("log_act_scale", torch.log(self.act_scale))
-
-    def get_dist(self, x):
-        features = self.actor_backbone(x)
-        alpha = F.softplus(self.actor_alpha(features)) + 1.0
-        beta = F.softplus(self.actor_beta(features)) + 1.0
-        return Beta(alpha, beta)
-
-    def get_value(self, x):
-        return self.critic(x)
-
-    def get_action_and_value(self, x, action=None):
-        dist = self.get_dist(x)
-
-        if action is None:
-            action_01 = dist.sample()
-            action_01 = action_01.clamp(1e-6, 1 - 1e-6)
-        else:
-            action_01 = (action - self.act_low) / self.act_scale
-            action_01 = action_01.clamp(1e-6, 1 - 1e-6)
-
-        action_env = self.act_low + self.act_scale * action_01
-
-        # log prob in normalized space
-        logprob_01 = dist.log_prob(action_01).sum(dim=1)
-
-        # affine transform correction: log |det da/du| = sum log(scale)
-        # so log p(a) = log p(u) - sum log(scale)
-        logprob_env = logprob_01 - self.log_act_scale.sum()
-
-        # differential entropy under affine transform:
-        entropy_env = dist.entropy().sum(dim=1) + self.log_act_scale.sum()
-
-        value = self.critic(x)
-        return action_env, logprob_env, entropy_env, value
-'''
-
 def make_env(gym_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0: # record video for the first environment
@@ -125,8 +59,10 @@ class Agent(nn.Module):
         self.actor_beta = layer_init(nn.Linear(64, act_dim), std=0.01)
 
         # action space bounds for rescaling 
-        self.act_low = torch.tensor(envs.single_action_space.low, dtype=torch.float32)
-        self.act_high = torch.tensor(envs.single_action_space.high, dtype=torch.float32)
+        self.register_buffer("act_low", torch.tensor(envs.single_action_space.low, dtype=torch.float32))
+        self.register_buffer("act_high", torch.tensor(envs.single_action_space.high, dtype=torch.float32))
+        self.register_buffer("act_scale", self.act_high - self.act_low)
+        self.register_buffer("log_act_scale", torch.log(self.act_scale))
 
     def get_dist(self, x):
         features = self.actor_backbone(x)
@@ -136,7 +72,7 @@ class Agent(nn.Module):
 
     def get_value(self, x):
         return self.critic(x)
-    
+    '''
     def get_action_and_value(self, x, action=None):
         dist = self.get_dist(x)
         if action is None:
@@ -147,7 +83,60 @@ class Agent(nn.Module):
         
         # then we rescale to actual action space for env interaction 
         action_env = action_01 * (self.act_high - self.act_low) + self.act_low
-        return (action_env, dist.log_prob(action_01).sum(1), dist.entropy().sum(1), self.critic(x),)
+        return (action_env, dist.log_prob(action_01).sum(1), dist.entropy().sum(1), self.critic(x),)'''
+        # Include the Jacobian correction in the returned log-prob, and optionally correct entropy too.
+    def get_action_and_value(self, x, action=None):
+        dist = self.get_dist(x)
+
+        if action is None:
+            action_01 = dist.sample()
+            action_01 = action_01.clamp(1e-6, 1 - 1e-6)
+        else:
+            action_01 = (action - self.act_low) / self.act_scale
+            action_01 = action_01.clamp(1e-6, 1 - 1e-6)
+
+        action_env = self.act_low + self.act_scale * action_01
+
+        # log prob in normalized space
+        logprob_01 = dist.log_prob(action_01).sum(dim=1)
+
+        # affine transform correction: log |det da/du| = sum log(scale), so log p(a) = log p(u) - sum log(scale)
+        logprob_env = logprob_01 - self.log_act_scale.sum()
+
+        # differential entropy under affine transform:
+        entropy_env = dist.entropy().sum(dim=1) + self.log_act_scale.sum()
+
+        value = self.critic(x)
+        return action_env, logprob_env, entropy_env, value
+
+# to recompute Advantages every data pass, and not every rollout 
+def recompute_gae(agent, obs, rewards, dones, next_obs, next_done, gamma, gae_lambda):
+    num_steps, num_envs = rewards.shape
+    obs_shape = obs.shape[2:]
+
+    with torch.no_grad():
+        flat_obs = obs.reshape((-1,) + obs_shape)
+        values = agent.get_value(flat_obs).view(num_steps, num_envs)
+        next_value = agent.get_value(next_obs).view(num_envs)
+
+        advantages = torch.zeros_like(rewards)
+        lastgaelam = torch.zeros(num_envs, device=rewards.device)
+
+        for t in reversed(range(num_steps)):
+            if t == num_steps - 1:
+                nextnonterminal = 1.0 - next_done
+                nextvalues = next_value
+            else:
+                nextnonterminal = 1.0 - dones[t + 1]
+                nextvalues = values[t + 1]
+
+            delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
+            lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
+            advantages[t] = lastgaelam
+
+        returns = advantages + values
+
+    return advantages, returns, values
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -170,8 +159,8 @@ def parse_args():
     parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=False,
                         nargs='?', const=True, help='capture video of the agent performance')
     # Algorithm arguments
-    parser.add_argument('--num-envs', type=int, default=1, help='number of parallel game enviroments')
-    parser.add_argument('--num-steps', type=int, default=2048, help='number of steps to run in each env per policy rollout') # rollouts data = 4*128
+    parser.add_argument('--num-envs', type=int, default=4, help='number of parallel game enviroments')#4
+    parser.add_argument('--num-steps', type=int, default=2048, help='number of steps to run in each env per policy rollout') # 2048 # rollouts data = 4*128
     parser.add_argument('--anneal-lr', type=lambda x:bool(strtobool(x)), default=True,
                         nargs='?', const=True, help='learning rate annealing for policy and value networks')
     parser.add_argument('--gae', type=lambda x:bool(strtobool(x)), default=True, nargs='?',
@@ -185,7 +174,7 @@ def parse_args():
     parser.add_argument('--clip-coef', type=float, default=0.25, help='the surrogate clipping coefficient')
     parser.add_argument('--clip-vloss', type=lambda x:bool(strtobool(x)), default=False, nargs='?',
                         const=True, help='whether or not use a clipped loss for the value funtion, as per the paper')
-    parser.add_argument('--ent-coef', type=float, default=0.01, help='coefficient of the entropy')  # try 0.01 afterwards, or try annealing : 0.01 * (1.0 - (update - 1.0) / num_updates)
+    parser.add_argument('--ent-coef', type=float, default=0.001, help='coefficient of the entropy')  # try 0.01 afterwards, or try annealing : 0.01 * (1.0 - (update - 1.0) / num_updates)
     parser.add_argument('--vf-coef', type=float, default=0.5, help='coefficient of the value function')
     parser.add_argument('--max-grad-norm', type=float, default=0.5, help='the max norm for the gradient clipping')
     parser.add_argument('--target-kl', type=float, default=0.015, help='the target KL divergence threshold') # for early stopping, also in OpenAI Spinning default=0.015
@@ -277,10 +266,10 @@ if __name__=="__main__":
 
             # execute the game and log data
             next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
-            done = np.logical_or(terminated, truncated)
+            #done = np.logical_or(terminated, truncated)
             rewards[step] = torch.as_tensor(reward, dtype=torch.float32, device=device).view(-1)  # Cannot convert a MPS Tensor to float64 dtype as the MPS framework doesn't support float64. Please use float32 instead
             next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
-            next_done = torch.as_tensor(done, dtype=torch.float32, device=device)
+            next_done = torch.as_tensor(terminated, dtype=torch.float32, device=device)
 
             if "_episode" in info: # for vector envs, info is a dict of arrays, not a list of dicts
                 for i, finished in enumerate(info["_episode"]):
@@ -322,14 +311,22 @@ if __name__=="__main__":
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        # to flatten only tensors that do not change across PPO epochs
+        #b_advantages = advantages.reshape(-1)
+        #b_returns = returns.reshape(-1)
+        #b_values = values.reshape(-1)
 
         # optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
+            # recompute advantages/returns/values using the current critic
+            advantages, returns, values_epoch = recompute_gae(agent, obs, rewards, dones, next_obs, next_done, args.gamma, args.gae_lambda)
+            # noe flatten
+            b_advantages = advantages.reshape(-1)
+            b_returns = returns.reshape(-1)
+            b_values = values_epoch.reshape(-1)
+            
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
@@ -384,7 +381,10 @@ if __name__=="__main__":
                 if approx_kl > args.target_kl:
                     break
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        #y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        with torch.no_grad():
+            y_pred = agent.get_value(b_obs).view(-1).cpu().numpy()
+        y_true = b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y    # if value function is a good indicator of the returns   
 
@@ -396,6 +396,11 @@ if __name__=="__main__":
         writer.add_scalar("loss/approx_kl", approx_kl.item(), global_step) 
         writer.add_scalar("loss/clipfrac", np.mean(clipfracs), global_step) 
         writer.add_scalar("loss/explained_variance", explained_var, global_step)  
+        # debug critic 
+        writer.add_scalar("debug/returns_std", b_returns.std().item(), global_step)
+        writer.add_scalar("debug/values_std", torch.as_tensor(y_pred).std().item(), global_step)
+        writer.add_scalar("debug/returns_mean", b_returns.mean().item(), global_step)
+        writer.add_scalar("debug/var_y", float(var_y), global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step) # Steps Per Second
 
