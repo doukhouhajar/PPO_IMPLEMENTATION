@@ -84,7 +84,7 @@ class Agent(nn.Module):
         # then we rescale to actual action space for env interaction 
         action_env = action_01 * (self.act_high - self.act_low) + self.act_low
         return (action_env, dist.log_prob(action_01).sum(1), dist.entropy().sum(1), self.critic(x),)'''
-        # Include the Jacobian correction in the returned log-prob, and optionally correct entropy too.
+        # Include the Jacobian correction in the returned log-prob and correct entropy too NOT REALLY IMPORTANT ION OUR CASE
     def get_action_and_value(self, x, action=None):
         dist = self.get_dist(x)
 
@@ -110,27 +110,28 @@ class Agent(nn.Module):
         return action_env, logprob_env, entropy_env, value
 
 # to recompute Advantages every data pass, and not every rollout 
-def recompute_gae(agent, obs, rewards, dones, next_obs, next_done, gamma, gae_lambda):
+def recompute_gae(agent, obs, next_obses, rewards, dones, terminateds, gamma, gae_lambda):
     num_steps, num_envs = rewards.shape
     obs_shape = obs.shape[2:]
 
     with torch.no_grad():
         flat_obs = obs.reshape((-1,) + obs_shape)
+        flat_next_obs = next_obses.reshape((-1,) + obs_shape)
+
         values = agent.get_value(flat_obs).view(num_steps, num_envs)
-        next_value = agent.get_value(next_obs).view(num_envs)
+        next_values = agent.get_value(flat_next_obs).view(num_steps, num_envs)
 
         advantages = torch.zeros_like(rewards)
-        lastgaelam = torch.zeros(num_envs, device=rewards.device)
+        lastgaelam = torch.zeros(num_envs, dtype=torch.float32, device=rewards.device)
 
         for t in reversed(range(num_steps)):
-            if t == num_steps - 1:
-                nextnonterminal = 1.0 - next_done
-                nextvalues = next_value
-            else:
-                nextnonterminal = 1.0 - dones[t + 1]
-                nextvalues = values[t + 1]
+            # stop GAE recursion across episode boundary
+            nextnonterminal = 1.0 - dones[t]
 
-            delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
+            # but only suppress bootstrap on true termination
+            nextnotterminated = 1.0 - terminateds[t]
+
+            delta = rewards[t] + gamma * next_values[t] * nextnotterminated - values[t]
             lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
             advantages[t] = lastgaelam
 
@@ -236,6 +237,9 @@ if __name__=="__main__":
     rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
     dones = torch.zeros((args.num_steps, args.num_envs), device=device)
     values = torch.zeros((args.num_steps, args.num_envs), device=device)
+    terminateds = torch.zeros((args.num_steps, args.num_envs), device=device)
+    next_values_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
+    next_obses = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
 
     # Start the game
     global_step = 0
@@ -255,7 +259,6 @@ if __name__=="__main__":
         for step in range(0, args.num_steps):
             global_step += 1 * args.num_envs
             obs[step] = next_obs
-            dones[step] = next_done
 
             # action logic
             with torch.no_grad():
@@ -265,11 +268,28 @@ if __name__=="__main__":
             logprobs[step] = logprob
 
             # execute the game and log data
-            next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
-            #done = np.logical_or(terminated, truncated)
+            next_obs_np, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+            done = np.logical_or(terminated, truncated)
             rewards[step] = torch.as_tensor(reward, dtype=torch.float32, device=device).view(-1)  # Cannot convert a MPS Tensor to float64 dtype as the MPS framework doesn't support float64. Please use float32 instead
-            next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
-            next_done = torch.as_tensor(terminated, dtype=torch.float32, device=device)
+            dones[step] = torch.as_tensor(done, dtype=torch.float32, device=device).view(-1)
+            terminateds[step] = torch.as_tensor(terminated, dtype=torch.float32, device=device).view(-1)
+
+            # for bootstrapping use the true next observation of this transition
+            bootstrap_obs_np = next_obs_np.copy()
+
+            if "final_observation" in info:
+                for i in range(args.num_envs):
+                    if done[i] and info["final_observation"][i] is not None:
+                        bootstrap_obs_np[i] = info["final_observation"][i]
+
+            bootstrap_obs = torch.as_tensor(bootstrap_obs_np, dtype=torch.float32, device=device)
+            next_obses[step] = bootstrap_obs
+
+            with torch.no_grad():
+                next_values_buf[step] = agent.get_value(bootstrap_obs).flatten()
+
+            next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+            next_done = torch.as_tensor(done, dtype=torch.float32, device=device)
 
             if "_episode" in info: # for vector envs, info is a dict of arrays, not a list of dicts
                 for i, finished in enumerate(info["_episode"]):
@@ -281,30 +301,40 @@ if __name__=="__main__":
             
         # bootstrap reward if not done 
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).flatten()      #agent.get_value(next_obs).reshape(1, -1)
             if args.gae:
-                advantages = torch.zeros_like(rewards).to(device)
-                lastgaelam = 0
+                advantages = torch.zeros_like(rewards, device=device)
+                lastgaelam = torch.zeros(args.num_envs, dtype=torch.float32, device=device)
+
                 for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        nextvalues = next_value
-                    else:
-                        nextnonterminal = 1.0 - dones[t+1]
-                        nextvalues = values[t + 1]
-                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                    # stop GAE recursion when episode ended (terminated OR truncated)
+                    nextnonterminal = 1.0 - dones[t]
+
+                    # but only remove bootstrap on true termination
+                    nextnotterminated = 1.0 - terminateds[t]
+
+                    delta = rewards[t] + args.gamma * next_values_buf[t] * nextnotterminated - values[t]
+                    lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                    advantages[t] = lastgaelam
+
                 returns = advantages + values
+
             else:
-                returns = torch.zeros_like(rewards).to(device)
+                returns = torch.zeros_like(rewards, device=device)
+
                 for t in reversed(range(args.num_steps)):
                     if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        next_return = next_value 
+                        next_return = next_values_buf[t]
                     else:
-                        nextnonterminal = 1.0 - dones[t + 1]
-                        next_return = returns[t + 1]
-                    returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
+                        # if step t ended the episode do not continue with returns[t+1] because returns[t+1] belongs to the next episode
+                        next_return = torch.where(
+                            dones[t].bool(),
+                            next_values_buf[t],
+                            returns[t + 1],
+                        )
+
+                    # only suppress bootstrap on true termination
+                    returns[t] = rewards[t] + args.gamma * (1.0 - terminateds[t]) * next_return
+
                 advantages = returns - values
 
         # flatten the batch
@@ -321,11 +351,11 @@ if __name__=="__main__":
         clipfracs = []
         for epoch in range(args.update_epochs):
             # recompute advantages/returns/values using the current critic
-            advantages, returns, values_epoch = recompute_gae(agent, obs, rewards, dones, next_obs, next_done, args.gamma, args.gae_lambda)
+            advantages, returns, values_epoch = recompute_gae(agent, obs, next_obses, rewards, dones, terminateds, args.gamma, args.gae_lambda)
             # noe flatten
             b_advantages = advantages.reshape(-1)
             b_returns = returns.reshape(-1)
-            b_values = values_epoch.reshape(-1)
+            b_values_old = values.reshape(-1)
             
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -358,8 +388,8 @@ if __name__=="__main__":
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
+                    v_clipped = b_values_old[mb_inds] + torch.clamp( 
+                        newvalue - b_values_old[mb_inds],
                         -args.clip_coef,
                         args.clip_coef,
                     )
