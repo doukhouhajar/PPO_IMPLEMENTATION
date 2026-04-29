@@ -200,7 +200,7 @@ if __name__=="__main__":
             name=run_name,
             group=f"ppo-{args.gym_id}",
             monitor_gym=False, # for W&B and Gymnasium record video systems
-            save_code=True,
+            save_code=False,
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
