@@ -157,6 +157,7 @@ def parse_args():
                          nargs='?', const=True, help='if toggled, this expirement will be tracked with Weights and Biases')
     parser.add_argument('--wandb-project-name', type=str, default='PPO', help='wandb project name')
     parser.add_argument('--wandb-entity', type=str, default=None, help='team of wandb project')
+    parser.add_argument('--wandb-group-name', type=str, default=None, help='name of wandb group runs')
     parser.add_argument('--capture-video', type=lambda x:bool(strtobool(x)), default=False,
                         nargs='?', const=True, help='capture video of the agent performance')
     # Algorithm arguments
@@ -179,6 +180,12 @@ def parse_args():
     parser.add_argument('--vf-coef', type=float, default=0.5, help='coefficient of the value function')
     parser.add_argument('--max-grad-norm', type=float, default=0.5, help='the max norm for the gradient clipping')
     parser.add_argument('--target-kl', type=float, default=0.015, help='the target KL divergence threshold') # for early stopping, also in OpenAI Spinning default=0.015
+    parser.add_argument('--beta-one', type=float, default=0.9, help='Adam beta_one governs momentum (1st moment)')
+    parser.add_argument('--beta-two', type=float, default=0.999, help='Adam beta_two governs scaling (2nd moment)')
+    # Momentum warmup
+    parser.add_argument('--warmup-beta-one', type=lambda x: bool(strtobool(x)), default=False, nargs='?', const=True, help='linearly warm up beta_1 from beta-one-start to beta-one')
+    parser.add_argument('--beta-one-start', type=float, default=0.5, help='initial beta_1 for momentum warmup')
+    parser.add_argument('--warmup-steps', type=int, default=500000, help='number of env steps over which beta_1 is warmed up')
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -198,7 +205,7 @@ if __name__=="__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
-            group=f"ppo-{args.gym_id}",
+            group=args.wandb_group_name,
             monitor_gym=False, # for W&B and Gymnasium record video systems
             save_code=False,
         )
@@ -228,7 +235,7 @@ if __name__=="__main__":
    
     agent = Agent(envs).to(device)
     #print(agent)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, betas=(args.beta_one, args.beta_two), eps=1e-5) #NAdam
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
@@ -254,7 +261,18 @@ if __name__=="__main__":
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates # goes from 1 to 0
             lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+            #optimizer.param_groups[0]["lr"] = lrnow   # get it back si no quieres Momentum warmup
+        #########################################
+        # beta1 momentum warmup
+        if args.warmup_beta_one:
+            warmup_updates = max(args.warmup_steps // args.batch_size, 1)
+            if update <= warmup_updates:
+                frac_w = (update - 1) / warmup_updates          # 0 to 1
+                beta1_now = args.beta_one_start + frac_w * (args.beta_one - args.beta_one_start)
+            else:
+                beta1_now = args.beta_one
+            optimizer.param_groups[0]["betas"] = (beta1_now, args.beta_two)
+        #########################################
 
         for step in range(0, args.num_steps):
             global_step += 1 * args.num_envs
@@ -420,6 +438,7 @@ if __name__=="__main__":
 
         # record rewards 
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("charts/beta_one", optimizer.param_groups[0]["betas"][0], global_step)  # Momentum warup
         writer.add_scalar("loss/value_loss", v_loss.item(), global_step)    
         writer.add_scalar("loss/policy_loss", pg_loss.item(), global_step) 
         writer.add_scalar("loss/entropy", entropy_loss.item(), global_step) 
