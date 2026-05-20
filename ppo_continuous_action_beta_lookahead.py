@@ -158,6 +158,73 @@ def grad_momentum_cosine(optimizer):
     g = torch.cat(grad_vecs)
     m = torch.cat(mom_vecs)
     return F.cosine_similarity(g.unsqueeze(0), m.unsqueeze(0)).item()
+# Lookahead optimizer wrapper (maintains slow weights phi alongside the inner optimizer's fast weights theta)
+class Lookahead:
+    def __init__(self, optimizer, k=5, alpha=0.5):
+        self.optimizer   = optimizer
+        self.k           = k
+        self.alpha       = alpha
+        self._step_count = 0
+
+        # Clone current parameters as slow weights
+        self.slow_weights = [
+            [p.data.clone().detach() for p in group["params"]]
+            for group in self.optimizer.param_groups
+        ]
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+    # sync slow weights every k steps
+    def step(self):
+        self.optimizer.step()
+        self._step_count += 1
+        if self._step_count % self.k == 0:
+            self._sync()
+
+    def _sync(self):
+        for group, slow_group in zip(self.optimizer.param_groups, self.slow_weights):
+            for p, slow in zip(group["params"], slow_group):
+                # interpolate slow toward fast
+                slow.add_(self.alpha * (p.data - slow))
+                # reset fast weights to slow weights (the Lookahead "consolidation")
+                p.data.copy_(slow)
+    # Call at rollout boundaries to ensure slow weights are fresh
+    def force_sync(self):
+        self._sync()
+        self._step_count = 0  # reset counter after forced sync
+
+    def load_slow_weights(self):
+        self._fast_backup = [
+            [p.data.clone() for p in group["params"]]
+            for group in self.optimizer.param_groups
+        ]
+        for group, slow_group in zip(self.optimizer.param_groups, self.slow_weights):
+            for p, slow in zip(group["params"], slow_group):
+                p.data.copy_(slow)
+
+    def restore_fast_weights(self):
+        for group, backup_group in zip(self.optimizer.param_groups, self._fast_backup):
+            for p, fast in zip(group["params"], backup_group):
+                p.data.copy_(fast)
+        del self._fast_backup
+
+    # Proxy properties so the rest of the code can access optimizer internals
+    @property
+    def param_groups(self):
+        return self.optimizer.param_groups
+
+    @property
+    def state(self):
+        return self.optimizer.state
+
+    def state_dict(self):
+        return {
+            "inner_optimizer": self.optimizer.state_dict(),
+            "slow_weights":    self.slow_weights,
+            "step_count":      self._step_count,
+            "k":               self.k,
+            "alpha":           self.alpha,
+        }
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -206,6 +273,11 @@ def parse_args():
     parser.add_argument('--warmup-beta-one', type=lambda x: bool(strtobool(x)), default=False, nargs='?', const=True, help='linearly warm up beta_1 from beta-one-start to beta-one')
     parser.add_argument('--beta-one-start', type=float, default=0.5, help='initial beta_1 for momentum warmup')
     parser.add_argument('--warmup-steps', type=int, default=500000, help='number of env steps over which beta_1 is warmed up')
+    # Lookahead arguments
+    parser.add_argument('--lookahead', type=lambda x: bool(strtobool(x)), default=False, nargs='?', const=True, help='wrap optimizer with Lookahead')
+    parser.add_argument('--lookahead-k', type=int, default=5, help='Lookahead sync frequency (inner steps between slow-weight updates)')
+    parser.add_argument('--lookahead-alpha', type=float, default=0.5, help='Lookahead interpolation coefficient')
+    parser.add_argument('--lookahead-rollout-mode', type=str, default='fast', choices=['fast', 'slow'], help='which weights to use for rollout collection: fast theta or slow phi')
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -255,7 +327,11 @@ if __name__=="__main__":
    
     agent = Agent(envs).to(device)
     #print(agent)
-    optimizer = optim.NAdam(agent.parameters(), lr=args.learning_rate, betas=(args.beta_one, args.beta_two), eps=1e-5) #NAdam
+    if args.lookahead:
+        optimizer = Lookahead( optim.NAdam(agent.parameters(), lr=args.learning_rate, betas=(args.beta_one, args.beta_two), eps=1e-5), 
+        k=args.lookahead_k, alpha=args.lookahead_alpha)
+    else:
+        optimizer = optim.NAdam(agent.parameters(), lr=args.learning_rate, betas=(args.beta_one, args.beta_two), eps=1e-5) #NAdam
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)
@@ -294,6 +370,10 @@ if __name__=="__main__":
             optimizer.param_groups[0]["betas"] = (beta1_now, args.beta_two)
         #########################################
 
+        # 
+        if args.lookahead and args.lookahead_rollout_mode == 'slow':
+            optimizer.load_slow_weights()
+
         for step in range(0, args.num_steps):
             global_step += 1 * args.num_envs
             obs[step] = next_obs
@@ -329,12 +409,16 @@ if __name__=="__main__":
             next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
             next_done = torch.as_tensor(done, dtype=torch.float32, device=device)
 
-            if "_episode" in info: # for vector envs, info is a dict of arrays, not a list of dicts
+            if "_episode" in info:
                 for i, finished in enumerate(info["_episode"]):
                     if finished:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r'][i]}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"][i], global_step)
+                        ep_return = info["episode"]["r"][i]
+                        writer.add_scalar("charts/episodic_return", ep_return, global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"][i], global_step)
+                        print(f"global_step={global_step}, episodic_return={ep_return:.2f}")
+
+        if args.lookahead and args.lookahead_rollout_mode == 'slow':
+            optimizer.restore_fast_weights()
 
             
         # bootstrap reward if not done 
@@ -454,6 +538,27 @@ if __name__=="__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
+
+        if args.lookahead:
+            # Measure divergence BEFORE sync
+            slow_fast_divergence = 0.0
+            n_params = 0
+            for group, slow_group in zip(optimizer.param_groups, optimizer.slow_weights):
+                for p, slow in zip(group["params"], slow_group):
+                    slow_fast_divergence += (p.data - slow).norm().item() ** 2
+                    n_params += p.data.numel()
+            slow_fast_divergence = (slow_fast_divergence / n_params) ** 0.5
+            writer.add_scalar("debug/slow_fast_divergence", slow_fast_divergence, global_step)
+            # THEN sync (resets fast to slow, so gap becomes 0)
+            optimizer.force_sync()
+
+        # evaluate slow weights on one batch of observations
+        if args.lookahead and (update % 10 == 0):  # every 10 updates to save compute
+            optimizer.load_slow_weights()
+            with torch.no_grad():
+                slow_value = agent.get_value(b_obs[:256]).mean().item()  # cheap proxy
+            optimizer.restore_fast_weights()
+            writer.add_scalar("debug/slow_weights_value_estimate", slow_value, global_step)
 
         #y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         with torch.no_grad():

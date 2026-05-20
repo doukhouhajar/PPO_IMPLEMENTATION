@@ -1,3 +1,4 @@
+
 import argparse
 import os
 from distutils.util import strtobool
@@ -159,6 +160,17 @@ def grad_momentum_cosine(optimizer):
     m = torch.cat(mom_vecs)
     return F.cosine_similarity(g.unsqueeze(0), m.unsqueeze(0)).item()
 
+# Polyak update for actor parameters
+@torch.no_grad()
+def update_ema_actor(ema_agent, agent, tau):
+    for (name, ema_p), (_, live_p) in zip(
+        ema_agent.named_parameters(), agent.named_parameters()
+    ):
+        if name.startswith("actor"):
+            ema_p.data.mul_(1.0 - tau).add_(live_p.data, alpha=tau)
+        else:
+            ema_p.data.copy_(live_p.data)   # critic: exact sync, not averaged
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp-name', type=str, default=os.path.basename(__file__).rstrip(".py"),
@@ -206,6 +218,10 @@ def parse_args():
     parser.add_argument('--warmup-beta-one', type=lambda x: bool(strtobool(x)), default=False, nargs='?', const=True, help='linearly warm up beta_1 from beta-one-start to beta-one')
     parser.add_argument('--beta-one-start', type=float, default=0.5, help='initial beta_1 for momentum warmup')
     parser.add_argument('--warmup-steps', type=int, default=500000, help='number of env steps over which beta_1 is warmed up')
+    # Polyak averaging 
+    parser.add_argument('--polyak-tau', type=float, default=0.01, help='EMA coefficient (actor only)')
+    parser.add_argument('--use-ema-reference', type=lambda x: bool(strtobool(x)), default=False, nargs='?', const=True,
+                        help='use EMA policy as reference in PPO importance ratio instead of θ_old')
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -254,6 +270,12 @@ if __name__=="__main__":
 
    
     agent = Agent(envs).to(device)
+
+    ema_agent = Agent(envs).to(device)
+    ema_agent.load_state_dict(agent.state_dict())   # initialise θ̄₀ = θ₀
+    for p in ema_agent.parameters():
+        p.requires_grad_(False)                     # never trained directly
+
     #print(agent)
     optimizer = optim.NAdam(agent.parameters(), lr=args.learning_rate, betas=(args.beta_one, args.beta_two), eps=1e-5) #NAdam
 
@@ -404,7 +426,17 @@ if __name__=="__main__":
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], b_actions[mb_inds]
                 )
-                logratio = newlogprob - b_logprobs[mb_inds]
+                #logratio = newlogprob - b_logprobs[mb_inds] #this is being commented so that we try replacing Theta old, with EMA Theta
+                # Experiment B: θ̄ as reference instead of θ_old
+                if args.use_ema_reference:
+                    with torch.no_grad():
+                        _, ref_logprob, _, _ = ema_agent.get_action_and_value(
+                            b_obs[mb_inds], b_actions[mb_inds]
+                        )
+                    logratio = newlogprob - ref_logprob
+                else:
+                    logratio = newlogprob - b_logprobs[mb_inds]   # standard PPO
+
                 ratio = logratio.exp()
 
                 # debug variable
@@ -455,6 +487,19 @@ if __name__=="__main__":
                 if approx_kl > args.target_kl:
                     break
 
+        update_ema_actor(ema_agent, agent, args.polyak_tau)
+
+        with torch.no_grad():
+            live_dist   = agent.get_dist(b_obs)
+            ema_dist    = ema_agent.get_dist(b_obs)
+            kl_ema_live = torch.distributions.kl_divergence(ema_dist, live_dist).sum(-1).mean()
+            ema_entropy = ema_dist.entropy().sum(-1).mean()
+            ema_params  = torch.cat([p.data.flatten() for n, p in ema_agent.named_parameters() if n.startswith("actor")])
+            live_params = torch.cat([p.data.flatten() for n, p in agent.named_parameters()     if n.startswith("actor")])
+            param_dist  = (ema_params - live_params).norm().item()
+
+        
+
         #y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         with torch.no_grad():
             y_pred = agent.get_value(b_obs).view(-1).cpu().numpy()
@@ -478,6 +523,10 @@ if __name__=="__main__":
         writer.add_scalar("debug/values_std", torch.as_tensor(y_pred).std().item(), global_step)
         writer.add_scalar("debug/returns_mean", b_returns.mean().item(), global_step)
         writer.add_scalar("debug/var_y", float(var_y), global_step)
+        # EMA
+        writer.add_scalar("ema/kl_ema_live", kl_ema_live.item(), global_step)
+        writer.add_scalar("ema/entropy", ema_entropy.item(), global_step)
+        writer.add_scalar("ema/param_l2_dist", param_dist, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step) # Steps Per Second
 
