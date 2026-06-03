@@ -243,7 +243,7 @@ if __name__=="__main__":
     # we store a copy of θ_{k-1} for the lookahead computation
     # Initialised to the current params so the first update is standard PPO 
     if args.nesterov_alpha > 0.0:
-        params_prev = {name: p.detach().clone() for name, p in agent.named_parameters()}
+        params_prev = {name: p.detach().clone() for name, p in agent.named_parameters()} # weight/bias tensors and their names
     else:
         params_prev = None
    
@@ -354,6 +354,22 @@ if __name__=="__main__":
         # first update params_prev == params_current so lookahead == current (standard PPO)
         if args.nesterov_alpha > 0.0:
             params_current = {name: p.detach().clone() for name, p in agent.named_parameters()}
+            # to check if the parameters displacement really affects distribution displacement 
+            with torch.no_grad():
+                delta_sq = 0.0
+                param_sq = 0.0
+
+                for name in params_current:
+                    delta = params_current[name] - params_prev[name]
+                    delta_sq += delta.pow(2).sum()
+                    param_sq += params_current[name].pow(2).sum()
+
+                delta_norm = torch.sqrt(delta_sq).item()
+                param_norm = torch.sqrt(param_sq).item()
+                relative_delta_norm = delta_norm / (param_norm + 1e-8)
+
+            writer.add_scalar("debug/nesterov_param_delta_norm", delta_norm, global_step)
+            writer.add_scalar("debug/nesterov_param_relative_delta_norm", relative_delta_norm, global_step)
             # Temporarily load lookahead parameters into agent
             with torch.no_grad():
                 for name, p in agent.named_parameters():
@@ -363,6 +379,20 @@ if __name__=="__main__":
             with torch.no_grad():
                 _, b_logprobs_lookahead, _, _ = agent.get_action_and_value(b_obs, b_actions)
             b_logprobs = b_logprobs_lookahead
+
+            # π_old(a|s) / π_lookahead(a|s) and distribution displacement using log prob difference
+            logprob_old = logprobs.reshape(-1)
+            logprob_lh  = b_logprobs #lookahead
+            
+            logprob_diff = logprob_lh - logprob_old
+            old_to_lookahead_ratio = torch.exp(logprob_old - logprob_lh)
+
+            writer.add_scalar("debug/nesterov_logprob_diff_mean", logprob_diff.mean().item(), global_step)
+            writer.add_scalar("debug/nesterov_logprob_diff_std", logprob_diff.std().item(), global_step)
+            writer.add_scalar("debug/nesterov_old_to_lh_ratio_mean", old_to_lookahead_ratio.mean().item(), global_step)
+            writer.add_scalar("debug/nesterov_old_to_lh_ratio_std", old_to_lookahead_ratio.std().item(), global_step)
+
+
             # Log how much the lookahead deviates from π_old 
             kl_lookahead = (logprobs.reshape(-1) - b_logprobs).mean().item()
             writer.add_scalar("debug/nesterov_kl_lookahead", kl_lookahead, global_step)
@@ -437,7 +467,7 @@ if __name__=="__main__":
                 if approx_kl > args.target_kl:
                     break
 
-        # Update θ_{k-1} ← θ_k 
+        # θ_{k-1} = θ_k 
         if args.nesterov_alpha > 0.0:
             params_prev = {name: p.detach().clone() for name, p in agent.named_parameters()}
  
