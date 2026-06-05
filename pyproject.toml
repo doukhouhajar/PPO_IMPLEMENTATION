@@ -1,19 +1,18 @@
-[project]
+[tool.poetry]
 name = "ppo-implementation"
 version = "0.1.0"
 description = ""
-authors = [
-    {name = "doukhouhajar",email = "hajar.doukhou@outlook.com"}
-]
+authors = ["doukhouhajar <hajar.doukhou@outlook.com>"]
 readme = "README.md"
-requires-python = ">=3.11,<3.15"
-dependencies = [
-    "gym (>=0.26.2,<0.27.0)",
-    "torch (>=2.10.0,<3.0.0)",
-    "stable-baselines3 (>=2.7.1,<3.0.0)",
-    "tensorboard (>=2.20.0,<3.0.0)",
-    "wandb (>=0.25.0,<0.26.0)"
-]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+gymnasium = {extras = ["mujoco"], version = "^1.1.1"}
+torch = ">=2.3,<3.0"
+tensorboard = ">=2.20.0,<3.0.0"
+wandb = ">=0.25.0,<0.26.0"
+numpy = ">=1.26,<3.0"
+stable-baselines3 = ">=2.7.1,<3.0.0"
 
 
 [build-system]

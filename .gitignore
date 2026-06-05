@@ -1,3 +1,8 @@
 runs/
 videos/
 wandb/
+.venv/
+__pycache__/
+logs/
+*.sh
+poetry.lock
