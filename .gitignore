@@ -7,3 +7,10 @@ logs/
 *.sh
 poetry.lock
 .DS_Store
+hf_cache/
+data/
+checkpoints/
+poetry.toml
+summary_tables/
+
+

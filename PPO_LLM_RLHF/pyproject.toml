@@ -1,0 +1,34 @@
+[tool.poetry]
+name = "ppo-llm-rlhf-nesterov"
+version = "0.1.0"
+description = "Outer-loop Nesterov-accelerated PPO for RLHF (TinyLlama-1.1B-Chat, TL;DR summarization)"
+authors = ["Hajar Doukhou"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+
+
+trl = "0.11.4"
+transformers = "^4.44.0"
+peft = "^0.12.0"
+accelerate = "^0.33.0"
+datasets = "^2.20.0"
+
+torch = { version = "2.6.0", source = "pytorch-cu124" }
+
+wandb = "^0.17.0"
+
+bitsandbytes = "^0.43.0"
+sentencepiece = "^0.2.0"
+numpy = "<2.0"  # several deps in this stack still expect numpy 1.x
+rich = "^13.7.0"  # trl.trainer.utils imports this directly; not always pulled transitively
+
+[[tool.poetry.source]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

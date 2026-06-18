@@ -10,7 +10,7 @@ import wandb
 
 
 DEFAULT_ENTITY = "hajardoukhou-um6p"
-DEFAULT_PROJECT_PREFIX = "ppo_nesterov_corrected_parameters"
+DEFAULT_PROJECT_PREFIX = "ppo_nesterov_adaptive_parameters"
 
 ENVS = [
     "HalfCheetah-v5",
@@ -27,6 +27,8 @@ ENVS = [
 ]
 
 RETURN_KEY = "charts/episodic_return"
+ADAPTIVE_ACCEPTED_KEY = "debug/nesterov_accepted"
+
 LAST_N_EPISODES = 200
 ROLLING_WINDOW_EPISODES = 20
 
@@ -34,18 +36,20 @@ OUTPUT_COLUMNS = [
     "env",
     "distribution",
     "alpha",
+    "n_mean_return",
     "mean_mean_return",
     "median_mean_return",
     "std_mean_return",
     "max_mean_return",
     "min_mean_return",
-    "n_mean_return",
     "auc_return_mean",
     "auc_return_std",
     "steps_to_baseline_final_return_mean",
     "baseline_final_return_mean",
     "relative_final_improvement_pct_vs_alpha0",
     "sample_efficiency_step_gain_pct_vs_alpha0",
+    "adaptive_acceptance_rate_mean",
+    "adaptive_acceptance_rate_std",
 ]
 
 
@@ -57,6 +61,17 @@ def safe_float(value, default: float = np.nan) -> float:
         return value if np.isfinite(value) else default
     except Exception:
         return default
+
+
+def str_to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in {"true", "1", "yes", "y"}:
+        return True
+    if value in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def trapezoid_area(y: np.ndarray, x: np.ndarray) -> float:
@@ -97,6 +112,7 @@ def infer_run_identity(run) -> Tuple[str, float]:
                 run.config.get("exp_name"),
             ]
         ).lower()
+
         if "beta" in text:
             distribution = "beta"
         elif "normal" in text or "gaussian" in text:
@@ -112,7 +128,7 @@ def fetch_return_curve(run) -> pd.DataFrame:
     try:
         rows = list(run.scan_history(keys=["_step", RETURN_KEY]))
     except Exception as exc:
-        print(f"    [WARN] run={run.id}: could not scan history: {exc}")
+        print(f"    [WARN] run={run.id}: could not scan return history: {exc}")
         rows = []
 
     if not rows:
@@ -120,6 +136,7 @@ def fetch_return_curve(run) -> pd.DataFrame:
         if np.isfinite(fallback):
             print(f"    [INFO] run={run.id}: using summary fallback return={fallback:.2f}")
             return pd.DataFrame({"step": [np.nan], "episodic_return": [fallback]})
+
         print(f"    [WARN] run={run.id}: missing {RETURN_KEY}")
         return pd.DataFrame(columns=["step", "episodic_return"])
 
@@ -150,6 +167,31 @@ def fetch_return_curve(run) -> pd.DataFrame:
     return out
 
 
+def fetch_adaptive_acceptance_rate(run, alpha: float) -> float:
+    if np.isfinite(alpha) and np.isclose(alpha, 0.0):
+        return np.nan
+
+    try:
+        rows = list(run.scan_history(keys=[ADAPTIVE_ACCEPTED_KEY]))
+    except Exception as exc:
+        print(f"    [WARN] run={run.id}: could not scan adaptive history: {exc}")
+        return np.nan
+
+    if not rows:
+        print(f"    [WARN] run={run.id}: missing {ADAPTIVE_ACCEPTED_KEY}")
+        return np.nan
+
+    df = pd.DataFrame(rows)
+    if ADAPTIVE_ACCEPTED_KEY not in df.columns:
+        return np.nan
+
+    values = pd.to_numeric(df[ADAPTIVE_ACCEPTED_KEY], errors="coerce").dropna()
+    if values.empty:
+        return np.nan
+
+    return float(values.mean())
+
+
 def final_mean_return(curve: pd.DataFrame, last_n_episodes: int) -> float:
     if curve.empty:
         return np.nan
@@ -164,7 +206,8 @@ def normalized_auc_return(curve: pd.DataFrame) -> float:
     if tmp.empty:
         return np.nan
 
-    # Average duplicated steps if any exist
+    # Average duplicate steps if W&B/TensorBoard emitted several episode returns
+    # at the same global_step.
     tmp = tmp.groupby("step", as_index=False)["episodic_return"].mean()
 
     x = tmp["step"].to_numpy(dtype=float)
@@ -176,6 +219,7 @@ def normalized_auc_return(curve: pd.DataFrame) -> float:
 
     if len(y) == 0:
         return np.nan
+
     if len(y) == 1 or np.nanmax(x) == np.nanmin(x):
         return float(np.nanmean(y))
 
@@ -193,6 +237,8 @@ def first_step_reaching_threshold(
     tmp = curve[["step", "episodic_return"]].dropna().copy()
     if tmp.empty:
         return np.nan
+
+    tmp = tmp.sort_values("step").reset_index(drop=True)
 
     rolling_return = tmp["episodic_return"].rolling(
         window=rolling_window_episodes,
@@ -227,6 +273,9 @@ def collect_raw_runs(args) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
             distribution, alpha = infer_run_identity(run)
             seed = run.config.get("seed", np.nan)
 
+            if args.only_finished and run.state != "finished":
+                continue
+
             if distribution == "unknown" or not np.isfinite(alpha):
                 print(
                     f"    [WARN] run={run.id}: could not infer distribution/alpha "
@@ -246,29 +295,37 @@ def collect_raw_runs(args) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
                     "run_state": run.state,
                     "mean_return": final_mean_return(curve, args.last_n_episodes),
                     "auc_return": normalized_auc_return(curve),
+                    "adaptive_acceptance_rate": fetch_adaptive_acceptance_rate(run, alpha),
                 }
             )
 
     return pd.DataFrame(raw_records), curves_by_run_id
 
 
-def build_summary(raw: pd.DataFrame, curves_by_run_id: Dict[str, pd.DataFrame], args) -> pd.DataFrame:
+def build_summary(
+    raw: pd.DataFrame,
+    curves_by_run_id: Dict[str, pd.DataFrame],
+    args,
+) -> pd.DataFrame:
     if raw.empty:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     group_cols = ["env", "distribution", "alpha"]
     baseline_cols = ["env", "distribution"]
+
     summary = (
         raw.groupby(group_cols, dropna=False)
         .agg(
+            n_mean_return=("mean_return", "count"),
             mean_mean_return=("mean_return", "mean"),
             median_mean_return=("mean_return", "median"),
             std_mean_return=("mean_return", "std"),
             max_mean_return=("mean_return", "max"),
             min_mean_return=("mean_return", "min"),
-            n_mean_return=("mean_return", "count"),
             auc_return_mean=("auc_return", "mean"),
             auc_return_std=("auc_return", "std"),
+            adaptive_acceptance_rate_mean=("adaptive_acceptance_rate", "mean"),
+            adaptive_acceptance_rate_std=("adaptive_acceptance_rate", "std"),
         )
         .reset_index()
     )
@@ -282,16 +339,18 @@ def build_summary(raw: pd.DataFrame, curves_by_run_id: Dict[str, pd.DataFrame], 
     summary = summary.merge(baseline_final, on=baseline_cols, how="left")
 
     raw_with_baseline = raw.merge(baseline_final, on=baseline_cols, how="left")
-    steps_records = []
 
+    steps_records = []
     for row in raw_with_baseline.itertuples(index=False):
         threshold = safe_float(getattr(row, "baseline_final_return_mean", np.nan))
         curve = curves_by_run_id.get(row.run_id, pd.DataFrame())
+
         steps = first_step_reaching_threshold(
             curve=curve,
             threshold=threshold,
             rolling_window_episodes=args.rolling_window_episodes,
         )
+
         steps_records.append(
             {
                 "env": row.env,
@@ -321,22 +380,30 @@ def build_summary(raw: pd.DataFrame, curves_by_run_id: Dict[str, pd.DataFrame], 
         [baseline_cols + ["steps_to_baseline_final_return_mean"]]
         .rename(
             columns={
-                "steps_to_baseline_final_return_mean": "baseline_steps_to_baseline_final_return_mean"
+                "steps_to_baseline_final_return_mean": (
+                    "baseline_steps_to_baseline_final_return_mean"
+                )
             }
         )
     )
+
     summary = summary.merge(baseline_steps, on=baseline_cols, how="left")
 
     denom_return = summary["baseline_final_return_mean"].abs().replace(0.0, np.nan)
     summary["relative_final_improvement_pct_vs_alpha0"] = (
-        (summary["mean_mean_return"] - summary["baseline_final_return_mean"])
+        (
+            summary["mean_mean_return"]
+            - summary["baseline_final_return_mean"]
+        )
         / denom_return
         * 100.0
     )
 
-    # Sample-efficiency step gain vs alpha=0.
-    # Positive means the configuration reached the alpha=0 final-return level earlier.
-    denom_steps = summary["baseline_steps_to_baseline_final_return_mean"].replace(0.0, np.nan)
+    # Positive means the configuration reaches the alpha=0 final-return level earlier.
+    denom_steps = summary[
+        "baseline_steps_to_baseline_final_return_mean"
+    ].replace(0.0, np.nan)
+
     summary["sample_efficiency_step_gain_pct_vs_alpha0"] = (
         (
             summary["baseline_steps_to_baseline_final_return_mean"]
@@ -357,9 +424,11 @@ def build_summary(raw: pd.DataFrame, curves_by_run_id: Dict[str, pd.DataFrame], 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--entity", type=str, default=DEFAULT_ENTITY)
     parser.add_argument("--project-prefix", type=str, default=DEFAULT_PROJECT_PREFIX)
     parser.add_argument("--envs", nargs="+", default=ENVS)
+
     parser.add_argument(
         "--output-dir",
         type=str,
@@ -368,16 +437,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-file",
         type=str,
-        default="accelerated_ppo_summary.csv",
+        default="adaptive_accelerated_ppo_summary.csv",
     )
+
     parser.add_argument("--last-n-episodes", type=int, default=LAST_N_EPISODES)
     parser.add_argument(
         "--rolling-window-episodes",
         type=int,
         default=ROLLING_WINDOW_EPISODES,
-        help="Rolling window used to decide when a run reaches the baseline final return.",
+        help="Rolling episode window used to decide when a run reaches the baseline final return.",
     )
     parser.add_argument("--wandb-timeout", type=int, default=90)
+    parser.add_argument(
+        "--only-finished",
+        type=str_to_bool,
+        default=False,
+        help="If True, ignore W&B runs whose state is not 'finished'.",
+    )
+
     return parser.parse_args()
 
 
@@ -392,11 +469,11 @@ def main() -> None:
     summary.to_csv(output_path, index=False)
 
     pd.set_option("display.float_format", "{:.4f}".format)
-    pd.set_option("display.max_columns", 50)
-    pd.set_option("display.width", 180)
+    pd.set_option("display.max_columns", 80)
+    pd.set_option("display.width", 220)
 
     if summary.empty:
-        print("No valid runs found")
+        print("No valid runs found.")
     else:
         print(summary.to_string(index=False))
 
