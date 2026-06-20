@@ -255,7 +255,7 @@ if __name__=="__main__":
    
     agent = Agent(envs).to(device)
     #print(agent)
-    optimizer = optim.NAdam(agent.parameters(), lr=args.learning_rate, betas=(args.beta_one, args.beta_two), eps=1e-5) #NAdam
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, betas=(args.beta_one, args.beta_two), eps=1e-5) #NAdam
 
     # Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, device=device)

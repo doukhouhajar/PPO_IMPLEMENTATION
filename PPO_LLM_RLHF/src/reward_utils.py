@@ -9,31 +9,31 @@ REWARD_MODEL_NAME = "OpenAssistant/reward-model-deberta-v3-large-v2"
 
 
 class RewardModel:
-    """
-    Thin wrapper around the frozen reward model. Loaded once, reused across
-    the entire training run. Always in eval() mode, always under
-    torch.no_grad() during scoring -- no gradients should ever flow through
-    the RM.
-    """
-
     def __init__(
         self,
+        model_name: str = REWARD_MODEL_NAME,
         cache_dir: str = "./hf_cache",
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float16,
         max_length: int = 512,
-    ):
+        ):
+        self.model_name = model_name
         self.device = device or (
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
         self.max_length = max_length
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            REWARD_MODEL_NAME, cache_dir=cache_dir
+            model_name, cache_dir=cache_dir
         )
+
+        # Important: for prompt+answer pairs, keep the answer visible.
+        self.tokenizer.truncation_side = "left"
+
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            REWARD_MODEL_NAME, cache_dir=cache_dir, torch_dtype=dtype
+            model_name, cache_dir=cache_dir, torch_dtype=dtype
         ).to(self.device)
+
         self.model.eval()
 
         # Running statistics across all scoring calls -- useful for
@@ -63,7 +63,7 @@ class RewardModel:
             answers,
             return_tensors="pt",
             padding=True,
-            truncation=True,
+            truncation="only_first",
             max_length=self.max_length,
         ).to(self.device)
 
