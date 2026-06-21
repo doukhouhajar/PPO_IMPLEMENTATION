@@ -63,7 +63,7 @@ class RewardModel:
             answers,
             return_tensors="pt",
             padding=True,
-            truncation="only_first",
+            truncation=True,
             max_length=self.max_length,
         ).to(self.device)
 
